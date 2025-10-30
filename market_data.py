@@ -244,27 +244,34 @@ class MarketDataProvider:
             # Get current price
             current_price = self.get_current_price()
 
-            # Get historical candles
-            candles = self.get_historical_candles(timeframe="1", candles=100)
+            # Get historical candles - 1 minute
+            candles_1min = self.get_historical_candles(timeframe="1", candles=100)
 
-            if len(candles) == 0:
+            if len(candles_1min) == 0:
                 self.logger.error("No candle data available")
                 return {}
 
-            # Calculate indicators
-            rsi = self.calculate_rsi(candles, period=6)
-            ema13 = self.calculate_ema(candles, period=13)
-            atr = self.calculate_atr(candles, period=10)
-            supertrend = self.calculate_supertrend(candles, period=10, multiplier=3.0)
+            # Get historical candles - 5 minute
+            candles_5min = self.get_historical_candles(timeframe="5", candles=100)
+
+            # Calculate indicators from 1-min data
+            rsi = self.calculate_rsi(candles_1min, period=6)
+            ema13 = self.calculate_ema(candles_1min, period=13)
+            atr = self.calculate_atr(candles_1min, period=10)
+            supertrend = self.calculate_supertrend(candles_1min, period=10, multiplier=3.0)
+
+            # Calculate 5-min indicators
+            rsi_5min = self.calculate_rsi(candles_5min, period=6) if len(candles_5min) > 0 else rsi
+            atr_5min = self.calculate_atr(candles_5min, period=10) if len(candles_5min) > 0 else atr
 
             # Get price changes
-            first_candle = candles[0]
-            last_candle = candles[-1]
+            first_candle = candles_1min[0]
+            last_candle = candles_1min[-1]
 
             price_change = last_candle["close"] - first_candle["open"]
             price_change_percent = (price_change / first_candle["open"]) * 100
 
-            # Determine trend
+            # Determine trend from 1-min
             if supertrend["direction"] == "UP":
                 trend = "UPTREND"
             elif supertrend["direction"] == "DOWN":
@@ -279,7 +286,7 @@ class MarketDataProvider:
                     "price_change": price_change,
                     "price_change_percent": price_change_percent,
                     "volatility": atr,
-                    "candles": candles[-10:],  # Last 10 candles
+                    "candles": candles_1min[-10:],  # Last 10 candles
                     "trend": trend,
                     "rsi": rsi
                 },
@@ -292,16 +299,30 @@ class MarketDataProvider:
                 },
                 "price_data": {
                     "current_price": current_price,
-                    "candles": candles[-20:],  # Last 20 candles
-                    "high_of_day": max([c["high"] for c in candles]),
-                    "low_of_day": min([c["low"] for c in candles]),
-                    "prev_close": candles[-2]["close"] if len(candles) > 1 else current_price,
+                    "candles": candles_1min[-20:],  # Last 20 candles
+                    "high_of_day": max([c["high"] for c in candles_1min]),
+                    "low_of_day": min([c["low"] for c in candles_1min]),
+                    "prev_close": candles_1min[-2]["close"] if len(candles_1min) > 1 else current_price,
                     "trend": trend
+                },
+                "trade_evaluation_data": {
+                    "current_price": current_price,
+                    "spot_price": current_price,
+                    "candles_1min": candles_1min[-100:],  # Last 100 1-min candles
+                    "candles_5min": candles_5min[-100:] if len(candles_5min) > 0 else [],  # Last 100 5-min candles
+                    "atr": atr,
+                    "atr_5min": atr_5min,
+                    "indicators": {
+                        "rsi": rsi,
+                        "rsi_5min": rsi_5min,
+                        "ema": {"ema13": ema13}
+                    }
                 }
             }
 
             self.logger.info(f"Market data collected: Price={current_price:.2f}, "
-                           f"RSI={rsi:.2f}, Trend={trend}")
+                           f"RSI={rsi:.2f}, Trend={trend}, "
+                           f"5min candles: {len(candles_5min)}")
 
             return market_data
 
