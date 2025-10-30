@@ -1,0 +1,61 @@
+# Claude AI Trading Agent - Git Ignore
+
+# Configuration files with sensitive data
+config_fyers.ini
+config_trading_agent.ini
+
+# Logs
+logs/
+*.log
+
+# Data and state files
+data/
+*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*_backup_*
+
+# Trading data
+trade_history/
+backups/
