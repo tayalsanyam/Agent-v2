@@ -55,6 +55,7 @@ class TradingOrchestrator:
 
         # Decision threshold
         self.min_confidence_threshold = config.get("min_confidence_threshold", 0.65)
+        self.min_hold_confidence = config.get("min_hold_confidence", 0.45)
 
         # Memory: Track recent trades and state
         self.trade_history: List[Dict[str, Any]] = []
@@ -411,6 +412,195 @@ class TradingOrchestrator:
         except Exception as e:
             self.logger.error(f"Exit check error: {str(e)}")
             return None
+
+    def evaluate_ongoing_position(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Re-evaluate ongoing position using all agents to determine if we should continue holding
+
+        This method runs all agents with context about the current position and calculates
+        a "hold confidence" score. If the market conditions have changed and agents now
+        favor the opposite direction or neutral, it recommends exiting the position.
+
+        Args:
+            market_data: Current market data dictionary
+
+        Returns:
+            Dictionary with hold recommendation:
+            {
+                "hold_recommendation": "HOLD" or "EXIT",
+                "confidence": float (0.0-1.0),
+                "reasoning": str,
+                "agent_scores": dict,
+                "call_score": float,
+                "put_score": float
+            }
+        """
+        if not self.trade_manager.has_active_position():
+            return {
+                "hold_recommendation": "HOLD",
+                "confidence": 0.0,
+                "reasoning": "No active position"
+            }
+
+        try:
+            self.logger.info("=== Re-evaluating Active Position ===")
+
+            # Get current position info
+            position_info = self.trade_manager.get_position_info()
+            pnl_info = self.trade_manager.get_current_pnl()
+
+            position_direction = position_info.get("direction", "UNKNOWN")
+            current_pnl_percent = pnl_info.get("pnl_percent", 0)
+
+            # Build context with position details
+            position_context = self._build_position_context(position_info, pnl_info)
+
+            # Run market analysis with position context
+            analysis = self.analyze_market(market_data)
+
+            # Extract agent results
+            sentiment = analysis.get("sentiment", {})
+            indicators = analysis.get("indicators", {})
+            price_action = analysis.get("price_action", {})
+            trade_evaluation = analysis.get("trade_evaluation", {})
+
+            # Calculate weighted scores (same as make_decision)
+            call_score = 0.0
+            put_score = 0.0
+
+            # Sentiment contribution
+            sentiment_bias = sentiment.get("trading_bias", "NEUTRAL")
+            sentiment_conf = sentiment.get("confidence", 0.5)
+
+            if sentiment_bias == "CALLS":
+                call_score += self.sentiment_weight * sentiment_conf
+            elif sentiment_bias == "PUTS":
+                put_score += self.sentiment_weight * sentiment_conf
+            else:
+                call_score += self.sentiment_weight * 0.5
+                put_score += self.sentiment_weight * 0.5
+
+            # Indicator contribution
+            indicator_signal = indicators.get("signal", "NEUTRAL")
+            indicator_conf = indicators.get("confidence", 0.5)
+
+            if "CALL" in indicator_signal:
+                call_score += self.indicator_weight * indicator_conf
+            elif "PUT" in indicator_signal:
+                put_score += self.indicator_weight * indicator_conf
+            else:
+                call_score += self.indicator_weight * 0.5
+                put_score += self.indicator_weight * 0.5
+
+            # Price action contribution
+            price_bias = price_action.get("price_action_bias", "NEUTRAL")
+            price_conf = price_action.get("confidence", 0.5)
+
+            if price_bias == "BULLISH":
+                call_score += self.price_action_weight * price_conf
+            elif price_bias == "BEARISH":
+                put_score += self.price_action_weight * price_conf
+            else:
+                call_score += self.price_action_weight * 0.5
+                put_score += self.price_action_weight * 0.5
+
+            # Trade evaluation contribution
+            trade_direction = trade_evaluation.get("trade_direction", "NEUTRAL")
+            trade_conf = trade_evaluation.get("confidence", 0.5)
+
+            if trade_direction == "CALL":
+                call_score += self.trade_evaluation_weight * trade_conf
+            elif trade_direction == "PUT":
+                put_score += self.trade_evaluation_weight * trade_conf
+            else:
+                call_score += self.trade_evaluation_weight * 0.5
+                put_score += self.trade_evaluation_weight * 0.5
+
+            # Normalize scores
+            total_score = call_score + put_score
+            if total_score > 0:
+                call_score = call_score / total_score
+                put_score = put_score / total_score
+
+            # Determine hold confidence based on position direction
+            if position_direction == "CALL":
+                hold_confidence = call_score
+                opposing_score = put_score
+            elif position_direction == "PUT":
+                hold_confidence = put_score
+                opposing_score = call_score
+            else:
+                hold_confidence = 0.5
+                opposing_score = 0.5
+
+            # Build reasoning
+            reasoning_parts = []
+            reasoning_parts.append(f"Position: {position_direction} (P&L: {current_pnl_percent:+.2f}%)")
+            reasoning_parts.append(f"Current sentiment: {sentiment_bias} ({sentiment_conf:.2f})")
+            reasoning_parts.append(f"Indicators: {indicator_signal} ({indicator_conf:.2f})")
+            reasoning_parts.append(f"Price action: {price_bias} ({price_conf:.2f})")
+            reasoning_parts.append(f"Hold confidence: {hold_confidence:.2f}")
+
+            # Determine recommendation
+            if hold_confidence < self.min_hold_confidence:
+                recommendation = "EXIT"
+                reasoning_parts.append(f"BELOW threshold {self.min_hold_confidence:.2f} - Agents suggest exit")
+            else:
+                recommendation = "HOLD"
+                reasoning_parts.append(f"ABOVE threshold {self.min_hold_confidence:.2f} - Continue holding")
+
+            reasoning = " | ".join(reasoning_parts)
+
+            self.logger.info(f"Hold Evaluation: {recommendation} (Confidence: {hold_confidence:.2f})")
+            self.logger.info(f"Agent Scores - CALL: {call_score:.2f}, PUT: {put_score:.2f}")
+
+            return {
+                "hold_recommendation": recommendation,
+                "confidence": hold_confidence,
+                "reasoning": reasoning,
+                "agent_scores": {
+                    "sentiment": f"{sentiment_bias} ({sentiment_conf:.2f})",
+                    "indicators": f"{indicator_signal} ({indicator_conf:.2f})",
+                    "price_action": f"{price_bias} ({price_conf:.2f})",
+                    "trade_evaluation": f"{trade_direction} ({trade_conf:.2f})"
+                },
+                "call_score": call_score,
+                "put_score": put_score,
+                "opposing_score": opposing_score
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error evaluating ongoing position: {str(e)}")
+            return {
+                "hold_recommendation": "HOLD",
+                "confidence": 0.5,
+                "reasoning": f"Error during evaluation: {str(e)}",
+                "error": str(e)
+            }
+
+    def _build_position_context(self, position_info: Dict[str, Any], pnl_info: Dict[str, Any]) -> str:
+        """Build context string describing current position"""
+        direction = position_info.get("direction", "UNKNOWN")
+        entry_price = position_info.get("entry_price", 0)
+        current_pnl = pnl_info.get("pnl", 0)
+        pnl_percent = pnl_info.get("pnl_percent", 0)
+
+        entry_time = position_info.get("entry_time")
+        if entry_time:
+            holding_duration = (datetime.now() - entry_time).total_seconds() / 60
+            duration_str = f"{holding_duration:.0f} minutes"
+        else:
+            duration_str = "unknown duration"
+
+        context = f"\n=== ACTIVE POSITION CONTEXT ===\n"
+        context += f"Direction: {direction}\n"
+        context += f"Entry Price: Rs.{entry_price:.2f}\n"
+        context += f"Current P&L: Rs.{current_pnl:.2f} ({pnl_percent:+.2f}%)\n"
+        context += f"Holding Duration: {duration_str}\n"
+        context += f"Question: Should we continue holding this {direction} position or exit now?\n"
+        context += "=== END POSITION CONTEXT ===\n"
+
+        return context
 
     def close_position_and_update(self, exit_reason: str) -> Dict[str, Any]:
         """
