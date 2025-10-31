@@ -13,6 +13,7 @@ from agents.base_agent import BaseAgent
 from agents.sentiment_agent import MarketSentimentAgent
 from agents.indicator_agent import IndicatorAnalyserAgent
 from agents.price_agent import PriceAnalyserAgent
+from agents.trade_evaluation_agent import TradeEvaluationAgent
 from trade_manager import TradeManager
 
 
@@ -44,11 +45,13 @@ class TradingOrchestrator:
         self.sentiment_agent = MarketSentimentAgent(api_key)
         self.indicator_agent = IndicatorAnalyserAgent(api_key)
         self.price_agent = PriceAnalyserAgent(api_key)
+        self.trade_evaluation_agent = TradeEvaluationAgent(api_key)
 
         # Agent weights
-        self.sentiment_weight = config.get("sentiment_weight", 0.30)
-        self.indicator_weight = config.get("indicator_weight", 0.35)
-        self.price_action_weight = config.get("price_action_weight", 0.35)
+        self.sentiment_weight = config.get("sentiment_weight", 0.25)
+        self.indicator_weight = config.get("indicator_weight", 0.25)
+        self.price_action_weight = config.get("price_action_weight", 0.25)
+        self.trade_evaluation_weight = config.get("trade_evaluation_weight", 0.25)
 
         # Decision threshold
         self.min_confidence_threshold = config.get("min_confidence_threshold", 0.65)
@@ -62,6 +65,11 @@ class TradingOrchestrator:
         self.total_losses = 0
         self.daily_pnl = 0.0
         self.last_trade_result = None
+
+        # Store trade evaluation recommendations
+        self.current_target_points = 25  # Default minimum
+        self.current_sl_points = 20
+        self.peak_pnl_percent = 0.0  # Track peak profit for trailing SL
 
         # State file
         self.state_file = config.get("state_file", "data/agent_state.json")
@@ -92,6 +100,7 @@ class TradingOrchestrator:
             sentiment_data = market_data.get("sentiment_data", {})
             indicator_data = market_data.get("indicator_data", {})
             price_data = market_data.get("price_data", {})
+            trade_evaluation_data = market_data.get("trade_evaluation_data", {})
 
             # Add context from recent trades
             context = self._build_context()
@@ -106,11 +115,15 @@ class TradingOrchestrator:
             self.logger.info("Running Price Action Agent...")
             price_result = self.price_agent.analyze(price_data, context)
 
+            self.logger.info("Running Trade Evaluation Agent...")
+            trade_evaluation_result = self.trade_evaluation_agent.analyze(trade_evaluation_data, context)
+
             # Combine results
             combined_analysis = {
                 "sentiment": sentiment_result,
                 "indicators": indicator_result,
                 "price_action": price_result,
+                "trade_evaluation": trade_evaluation_result,
                 "timestamp": datetime.now().isoformat()
             }
 
@@ -142,9 +155,10 @@ class TradingOrchestrator:
             sentiment = analysis.get("sentiment", {})
             indicators = analysis.get("indicators", {})
             price_action = analysis.get("price_action", {})
+            trade_evaluation = analysis.get("trade_evaluation", {})
 
             # Check for errors
-            if sentiment.get("error") or indicators.get("error") or price_action.get("error"):
+            if sentiment.get("error") or indicators.get("error") or price_action.get("error") or trade_evaluation.get("error"):
                 self.logger.warning("One or more agents returned errors")
                 return {
                     "action": "WAIT",
@@ -191,6 +205,22 @@ class TradingOrchestrator:
                 call_score += self.price_action_weight * 0.5
                 put_score += self.price_action_weight * 0.5
 
+            # Trade evaluation contribution
+            trade_direction = trade_evaluation.get("trade_direction", "NEUTRAL")
+            trade_conf = trade_evaluation.get("confidence", 0.5)
+
+            if trade_direction == "CALL":
+                call_score += self.trade_evaluation_weight * trade_conf
+            elif trade_direction == "PUT":
+                put_score += self.trade_evaluation_weight * trade_conf
+            else:
+                call_score += self.trade_evaluation_weight * 0.5
+                put_score += self.trade_evaluation_weight * 0.5
+
+            # Store target and SL recommendations from trade evaluation agent
+            self.current_target_points = trade_evaluation.get("target_points", 25)
+            self.current_sl_points = trade_evaluation.get("stop_loss_points", 20)
+
             # Normalize scores (should already sum to ~1.0 but ensure)
             total_score = call_score + put_score
             if total_score > 0:
@@ -201,11 +231,11 @@ class TradingOrchestrator:
             if call_score > self.min_confidence_threshold:
                 action = "BUY_CALL"
                 confidence = call_score
-                reasoning = self._build_reasoning(sentiment, indicators, price_action, "CALL")
+                reasoning = self._build_reasoning(sentiment, indicators, price_action, trade_evaluation, "CALL")
             elif put_score > self.min_confidence_threshold:
                 action = "BUY_PUT"
                 confidence = put_score
-                reasoning = self._build_reasoning(sentiment, indicators, price_action, "PUT")
+                reasoning = self._build_reasoning(sentiment, indicators, price_action, trade_evaluation, "PUT")
             else:
                 action = "WAIT"
                 confidence = max(call_score, put_score)
@@ -218,10 +248,13 @@ class TradingOrchestrator:
                 "put_score": put_score,
                 "reasoning": reasoning,
                 "timestamp": datetime.now().isoformat(),
+                "target_points": self.current_target_points,
+                "sl_points": self.current_sl_points,
                 "agent_summary": {
                     "sentiment": f"{sentiment_bias} ({sentiment_conf:.2f})",
                     "indicators": f"{indicator_signal} ({indicator_conf:.2f})",
-                    "price_action": f"{price_bias} ({price_conf:.2f})"
+                    "price_action": f"{price_bias} ({price_conf:.2f})",
+                    "trade_evaluation": f"{trade_direction} ({trade_conf:.2f}) T:{self.current_target_points}pts SL:{self.current_sl_points}pts"
                 }
             }
 
@@ -286,7 +319,8 @@ class TradingOrchestrator:
 
             if result.get("success"):
                 self.daily_trades += 1
-                self.logger.info(f"Trade executed: {action}")
+                self.peak_pnl_percent = 0.0  # Reset peak tracker for new position
+                self.logger.info(f"Trade executed: {action} | Target: {self.current_target_points}pts | SL: {self.current_sl_points}pts")
 
             return {
                 "executed": result.get("success", False),
@@ -303,7 +337,8 @@ class TradingOrchestrator:
 
     def check_exit_conditions(self) -> Optional[str]:
         """
-        Check if active position should be exited
+        Check if active position should be exited using dynamic target/SL
+        and smart trailing stop logic
 
         Returns:
             Exit reason or None
@@ -319,24 +354,57 @@ class TradingOrchestrator:
                 return None
 
             pnl_percent = pnl_info.get("pnl_percent", 0)
+            current_price = pnl_info.get("current_price", 0)
+            entry_price = pnl_info.get("entry_price", 0)
 
-            # Check stop loss
-            stop_loss = -self.config.get("initial_stop_loss_percent", 3.0)
-            if pnl_percent <= stop_loss:
+            # Calculate points gained/lost
+            if entry_price > 0:
+                pnl_points = abs(current_price - entry_price)
+            else:
+                pnl_points = 0
+
+            # Update peak P&L for trailing
+            if pnl_percent > self.peak_pnl_percent:
+                self.peak_pnl_percent = pnl_percent
+                self.logger.info(f"New peak P&L: {self.peak_pnl_percent:.2f}%")
+
+            # Check stop loss using agent's recommendation
+            # Convert points to percentage for comparison
+            sl_threshold_percent = -(self.current_sl_points / entry_price * 100) if entry_price > 0 else -3.0
+
+            if pnl_percent <= sl_threshold_percent:
+                self.logger.info(f"Stop Loss hit: {pnl_percent:.2f}% <= {sl_threshold_percent:.2f}%")
                 return "STOP_LOSS"
 
-            # Check target profit
-            target_profit = self.config.get("target_profit_percent", 3.0)
-            if pnl_percent >= target_profit:
+            # Check target profit using agent's recommendation
+            target_threshold_percent = (self.current_target_points / entry_price * 100) if entry_price > 0 else 3.0
+
+            if pnl_percent >= target_threshold_percent:
+                self.logger.info(f"Target hit: {pnl_percent:.2f}% >= {target_threshold_percent:.2f}%")
                 return "TARGET"
 
-            # Check trailing stop (simplified)
-            # In production, track max profit and trail from there
-            trailing_distance = self.config.get("trailing_stop_distance", 2.5)
-            if pnl_percent > trailing_distance:
-                # If we're in profit, check if we've given back too much
-                # This is simplified - full implementation would track peak profit
-                pass
+            # Smart Dynamic Trailing Stop Logic
+            # Only activate if we've made significant profit
+            if self.peak_pnl_percent > 0.5:  # At least 0.5% profit achieved
+                # Calculate trailing distance based on profit magnitude
+                # More profit = tighter trail to protect gains
+                if self.peak_pnl_percent >= 3.0:
+                    # High profit: Trail tightly (allow 20% giveback)
+                    trailing_threshold = self.peak_pnl_percent * 0.80
+                elif self.peak_pnl_percent >= 2.0:
+                    # Good profit: Trail moderately (allow 25% giveback)
+                    trailing_threshold = self.peak_pnl_percent * 0.75
+                elif self.peak_pnl_percent >= 1.0:
+                    # Decent profit: Trail loosely (allow 30% giveback)
+                    trailing_threshold = self.peak_pnl_percent * 0.70
+                else:
+                    # Small profit: Trail very loosely (allow 40% giveback)
+                    trailing_threshold = self.peak_pnl_percent * 0.60
+
+                if pnl_percent < trailing_threshold:
+                    self.logger.info(f"Trailing Stop hit: Current {pnl_percent:.2f}% < Threshold {trailing_threshold:.2f}% "
+                                   f"(Peak was {self.peak_pnl_percent:.2f}%)")
+                    return "TRAILING_STOP"
 
             return None
 
@@ -378,6 +446,9 @@ class TradingOrchestrator:
 
             self.daily_pnl += pnl
             self.last_trade_result = "WIN" if is_win else "LOSS"
+
+            # Reset peak tracker for next trade
+            self.peak_pnl_percent = 0.0
 
             # Add to trade history
             trade_record = {
@@ -444,39 +515,46 @@ class TradingOrchestrator:
         return base_multiplier
 
     def _check_trading_limits(self) -> bool:
-        """Check if trading limits are reached"""
-        # Check daily trade limit
-        max_trades = self.config.get("max_daily_trades", 50)
-        if self.daily_trades >= max_trades:
-            self.logger.warning(f"Daily trade limit reached: {self.daily_trades}/{max_trades}")
-            return False
+        """
+        Check if trading limits are reached
+        NOTE: Trade limits are DISABLED as per user request for unlimited trading
+        """
+        # ALL LIMITS DISABLED - UNLIMITED TRADING MODE
+        # Trade limits commented out but kept for reference
 
-        # Check daily win target
-        daily_win_target = self.config.get("daily_win_target", 10)
-        if self.win_streak >= daily_win_target:
-            self.logger.info(f"Daily win target achieved: {self.win_streak} consecutive wins!")
-            return False
+        # # Check daily trade limit
+        # max_trades = self.config.get("max_daily_trades", 50)
+        # if self.daily_trades >= max_trades:
+        #     self.logger.warning(f"Daily trade limit reached: {self.daily_trades}/{max_trades}")
+        #     return False
 
-        # Check max consecutive losses
-        max_losses = self.config.get("max_consecutive_losses", 3)
-        if self.loss_streak >= max_losses:
-            self.logger.warning(f"Max consecutive losses reached: {self.loss_streak}")
-            return False
+        # # Check daily win target
+        # daily_win_target = self.config.get("daily_win_target", 10)
+        # if self.win_streak >= daily_win_target:
+        #     self.logger.info(f"Daily win target achieved: {self.win_streak} consecutive wins!")
+        #     return False
 
-        # Check daily P&L limits
-        loss_limit = self.config.get("daily_loss_limit", -5.0)
-        profit_limit = self.config.get("daily_profit_limit", 12.0)
+        # # Check max consecutive losses
+        # max_losses = self.config.get("max_consecutive_losses", 3)
+        # if self.loss_streak >= max_losses:
+        #     self.logger.warning(f"Max consecutive losses reached: {self.loss_streak}")
+        #     return False
 
-        pnl_percent = (self.daily_pnl / self.trade_manager.initial_capital) * 100
+        # # Check daily P&L limits
+        # loss_limit = self.config.get("daily_loss_limit", -5.0)
+        # profit_limit = self.config.get("daily_profit_limit", 12.0)
 
-        if pnl_percent <= loss_limit:
-            self.logger.warning(f"Daily loss limit reached: {pnl_percent:.2f}%")
-            return False
+        # pnl_percent = (self.daily_pnl / self.trade_manager.initial_capital) * 100
 
-        if pnl_percent >= profit_limit:
-            self.logger.info(f"Daily profit target achieved: {pnl_percent:.2f}%")
-            return False
+        # if pnl_percent <= loss_limit:
+        #     self.logger.warning(f"Daily loss limit reached: {pnl_percent:.2f}%")
+        #     return False
 
+        # if pnl_percent >= profit_limit:
+        #     self.logger.info(f"Daily profit target achieved: {pnl_percent:.2f}%")
+        #     return False
+
+        # No limits - always allow trading
         return True
 
     def _build_context(self) -> str:
@@ -500,6 +578,7 @@ class TradingOrchestrator:
                         sentiment: Dict,
                         indicators: Dict,
                         price_action: Dict,
+                        trade_evaluation: Dict,
                         direction: str) -> str:
         """Build reasoning for decision"""
         reasons = []
@@ -524,6 +603,13 @@ class TradingOrchestrator:
         if (direction == "CALL" and price_bias == "BULLISH") or \
            (direction == "PUT" and price_bias == "BEARISH"):
             reasons.append(f"Price action: {pattern}")
+
+        # Trade evaluation
+        trade_direction = trade_evaluation.get("trade_direction", "NEUTRAL")
+        if trade_direction == direction:
+            trend_alignment = trade_evaluation.get("trend_alignment", "UNKNOWN")
+            entry_quality = trade_evaluation.get("entry_quality", "UNKNOWN")
+            reasons.append(f"Setup: {entry_quality} ({trend_alignment})")
 
         return " | ".join(reasons) if reasons else "Multiple factors aligned"
 
