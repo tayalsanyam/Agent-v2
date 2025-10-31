@@ -87,6 +87,7 @@ def load_config(config_file: str = "config_trading_agent.ini") -> dict:
         "indicator_weight": config.getfloat("AGENTS", "indicator_weight"),
         "price_action_weight": config.getfloat("AGENTS", "price_action_weight"),
         "min_confidence_threshold": config.getfloat("AGENTS", "min_confidence_threshold"),
+        "min_hold_confidence": config.getfloat("AGENTS", "min_hold_confidence", fallback=0.45),
 
         # Memory
         "track_last_n_trades": config.getint("MEMORY", "track_last_n_trades"),
@@ -257,6 +258,24 @@ def main():
                 if orchestrator.trade_manager.has_active_position():
                     logger.info("Checking exit conditions...")
                     exit_reason = orchestrator.check_exit_conditions()
+
+                    # Step 1b: If no technical exit, re-evaluate position with agents
+                    if not exit_reason:
+                        logger.info("No technical exit. Re-evaluating position with agents...")
+                        market_data = market_data_provider.get_market_data()
+
+                        if market_data:
+                            hold_evaluation = orchestrator.evaluate_ongoing_position(market_data)
+
+                            if hold_evaluation.get("hold_recommendation") == "EXIT":
+                                exit_reason = "AGENT_CONFIDENCE_DROP"
+                                logger.info(f"Agents recommend exit: {hold_evaluation.get('reasoning')}")
+                                logger.info(f"Hold confidence: {hold_evaluation.get('confidence', 0):.2f} "
+                                          f"(Threshold: {orchestrator.min_hold_confidence:.2f})")
+                            else:
+                                logger.info(f"Agents recommend HOLD (Confidence: {hold_evaluation.get('confidence', 0):.2f})")
+                        else:
+                            logger.warning("Failed to fetch market data for position re-evaluation")
 
                     if exit_reason:
                         logger.info(f"Exit condition met: {exit_reason}")
